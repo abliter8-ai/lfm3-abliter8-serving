@@ -32,8 +32,9 @@ full speech-generation, and maximum-context correctness are not implied by a
 successful server start.
 
 A Snapdragon CPU Q6_K trial fitted 258,016 input tokens into the 262,144-token
-shared context pool, with 4,096 tokens reserved for generation. It returned
-no final answer in the bounded retrieval test. Short streaming, cancellation,
+shared context pool, with 4,096 tokens reserved for generation. The request hit
+the one-hour client timeout before a final answer; no server error was recorded
+in the receipt. Short streaming, cancellation,
 concurrency and prefix-cache checks passed. Treat full 256K text operation
 on this configuration as unqualified.
 
