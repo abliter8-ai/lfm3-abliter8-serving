@@ -1,0 +1,323 @@
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -149,6 +149,7 @@
+ int    opt_optrace   = 0;    // trace buffer size per thread (0 means default)
+ int    opt_oppoll    = 0;    // polling for batch completions
+ int    opt_opfusion  = 1;    // enable/disable op fusion
++int    opt_sync      = 0;    // synchronous FastRPC transport; default remains dspqueue
+ int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = quantized only (default), 2 = always
+ 
+ static std::regex* opt_opfilter = NULL; // regex of ops to not claim
+@@ -1778,6 +1779,41 @@
+         op_queue->push(req, dbuf, op_batch, seq);
+     }
+ 
++    if (opt_sync) {
++        auto execute_sync = [](ggml_hexagon_session * target, htp_opbatch_req & request, dspqueue_buffer & buffer) {
++            HEX_VERBOSE("ggml-hex: %s exec-opbatch: %p size %u\n", target->c_name(), buffer.ptr, buffer.size);
++            htp_opbatch_rsp response{};
++            int err = htp_iface_execute(target->handle, (const uint8_t *) &request, sizeof(request),
++                                        (uint8_t *) buffer.ptr, buffer.size,
++                                        (uint8_t *) &response, sizeof(response));
++            if (err != 0) {
++                GGML_ABORT("ggml-hex: %s htp_iface_execute failed: 0x%08x\n", target->c_name(), (unsigned) err);
++            }
++            if (response.status > HTP_STATUS_OK) {
++                target->last_error = response.status;
++                GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s\n", target->c_name(), status_to_str(response.status));
++            }
++            target->op_queue->pop(response, buffer);
++            GGML_ASSERT(response.seq == target->batch_rsp_seq + 1);
++            target->batch_rsp_seq = response.seq;
++        };
++
++        execute_sync(this, req, dbuf);
++        for (auto & sub : this->mdev.sessions) {
++            htp_opbatch_req sub_req{};
++            dspqueue_buffer sub_dbuf{};
++            sub->batch_req_seq = seq;
++            op_batch->update_mdev_group(sub->mdev.idx);
++            if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq)) {
++                sub->flush_pending(false);
++                sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq);
++            }
++            execute_sync(sub.get(), sub_req, sub_dbuf);
++        }
++        op_batch->reset();
++        return;
++    }
++
+     for (auto & sub : this->mdev.sessions) {
+         htp_opbatch_req sub_req {};
+         dspqueue_buffer sub_dbuf{};
+@@ -2189,6 +2225,12 @@
+     const size_t req_q_size = (sizeof(htp_opbatch_req) * opt_opqueue * 2) + 1024;
+     const size_t rsp_q_size = (sizeof(htp_opbatch_rsp) * opt_opqueue * 2) + 1024;
+ 
++    if (opt_sync) {
++        // IP-305 sync transport: no queue; queue_id 0 tells the DSP skel to run batches from execute()
++        this->queue    = nullptr;
++        this->queue_id = 0;
++        GGML_LOG_INFO("ggml-hex: %s sync transport: dspqueue not created\n", this->c_name());
++    } else {
+     // Now let's setup the DSP queue
+     err = dspqueue_create(this->domain_id,
+                           0,              // Flags
+@@ -2211,6 +2253,7 @@
+         GGML_LOG_ERROR("ggml-hex: dspqueue_export failed: 0x%08x\n", (unsigned) err);
+         throw std::runtime_error("ggml-hex: dspqueue export failed (see log for details)");
+     }
++    }
+ 
+     if (opt_etm) {
+         err = htp_iface_etm(this->handle, 1);
+@@ -2320,6 +2363,9 @@
+     this->dev_ctx    = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+     this->mdev.idx   = mdev_idx;
+     this->mdev.count = mdev_count > 0 ? mdev_count : (uint32_t) (1 + config.mdev_group.size());
++    if (opt_sync && this->mdev.count > 1) {
++        throw std::runtime_error("ggml-hex: GGML_HEXAGON_SYNC requires mdev.count == 1; synchronous multi-device fences are not supported");
++    }
+     op_batch         = nullptr;
+     op_queue         = nullptr;
+     fence_buf        = nullptr;
+@@ -3477,6 +3523,7 @@
+     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
+     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
+     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
++    const char * str_sync     = getenv("GGML_HEXAGON_SYNC");
+     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
+     const char * str_power_mode = getenv("GGML_HEXAGON_POWER_MODE");
+ 
+@@ -3557,6 +3604,10 @@
+     }
+     opt_vmem    = str_vmem    ? parse_size(str_vmem)   : opt_vmem;
+     opt_hostbuf = str_hostbuf ? atoi(str_hostbuf) != 0 : opt_hostbuf;
++    opt_sync    = str_sync ? atoi(str_sync) : opt_sync;
++    if (opt_sync) {
++        GGML_LOG_INFO("ggml-hex: synchronous transport enabled (GGML_HEXAGON_SYNC); batches run inside FastRPC invokes\n");
++    }
+ 
+     // Parse device configuration
+     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");
+--- a/ggml/src/ggml-hexagon/htp/htp_iface.idl
++++ b/ggml/src/ggml-hexagon/htp/htp_iface.idl
+@@ -18,6 +18,10 @@
+     AEEResult profiler(in uint32 mode, in htp_iface_pmu_conf pmu);
+     AEEResult etm(in uint32 enable);
+     AEEResult hwinfo(rout uint32 n_threads, rout uint32 n_hvx, rout uint32 n_hmx, rout uint64 vtcm_size);
++    // Synchronous transport (IP-305): run one op batch inside a FastRPC invoke instead of the dspqueue.
++    // req = htp_opbatch_req header, blk = the batch descriptor block (bufs/tensors/ops/profs), rsp = htp_opbatch_rsp.
++    // Used when start() was called with dsp_queue_id == 0 (no queue).
++    AEEResult execute(in sequence<uint8> req, inrout sequence<uint8> blk, rout sequence<uint8> rsp);
+ };
+ 
+ #endif /* HTP_IDL */
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -472,19 +472,27 @@
+ 
+     dspqueue_t dsp_queue = NULL;
+     bool use_callbacks = false;
++    // IP-305 sync transport: dsp_queue_id == 0 means the host drives batches through htp_iface_execute()
++    // (kernels without dspsignal/dspqueue support). No queue import, no main thread.
++    const bool sync_mode = (dsp_queue_id == 0);
++    int err = 0;
++
++    if (!sync_mode) {
++        // Import queue with NULL callbacks to avoid starting dspueue internal threads
++        err = dspqueue_import(dsp_queue_id, NULL, NULL, (void *) h, &dsp_queue);
++        if (err == AEE_EBADPARM) {
++            // Fallback for devices that don't support NULL callbacks
++            FARF(HIGH, "dspqueue import with NULL callbacks failed, trying with callbacks");
++            use_callbacks = true;
++            err = dspqueue_import(dsp_queue_id, htp_packet_callback, htp_error_callback, (void *) h, &dsp_queue);
++        }
+ 
+-    // Import queue with NULL callbacks to avoid starting dspueue internal threads
+-    int err = dspqueue_import(dsp_queue_id, NULL, NULL, (void *) h, &dsp_queue);
+-    if (err == AEE_EBADPARM) {
+-        // Fallback for devices that don't support NULL callbacks
+-        FARF(HIGH, "dspqueue import with NULL callbacks failed, trying with callbacks");
+-        use_callbacks = true;
+-        err = dspqueue_import(dsp_queue_id, htp_packet_callback, htp_error_callback, (void *) h, &dsp_queue);
+-    }
+-
+-    if (err) {
+-        FARF(ERROR, "Queue import failed with 0x%08x", (unsigned) err);
+-        return err;
++        if (err) {
++            FARF(ERROR, "Queue import failed with 0x%08x", (unsigned) err);
++            return err;
++        }
++    } else {
++        FARF(HIGH, "sync transport: no dspqueue, batches arrive via execute()");
+     }
+ 
+     qurt_sysenv_max_hthreads_t hw_threads;
+@@ -509,7 +517,7 @@
+     // 2. main_stack
+     size_t offset_main_stack = 0;
+     size_t size_main_stack   = 0;
+-    if (!use_callbacks) {
++    if (!use_callbacks && !sync_mode) {
+         offset_main_stack = hex_align_up(offset, 4096);
+         size_main_stack   = MAIN_THREAD_STACK_SIZE;
+         offset = offset_main_stack + size_main_stack;
+@@ -546,7 +554,7 @@
+     void * block = memalign(4096, footprint);
+     if (!block) {
+         FARF(ERROR, "Unable to allocate unified block of size %zu\n", footprint);
+-        dspqueue_close(dsp_queue);
++        if (dsp_queue) dspqueue_close(dsp_queue);
+         return AEE_ENOMEMORY;
+     }
+     memset(block, 0, footprint);
+@@ -687,7 +695,7 @@
+     ctx->main_thread = 0;
+     atomic_store(&ctx->killed, false);
+ 
+-    if (!use_callbacks) {
++    if (!use_callbacks && !sync_mode) {
+         // Start main compute thread
+         ctx->main_stack = (void *) ((uintptr_t) block + offset_main_stack);
+ 
+@@ -726,10 +734,15 @@
+         ctx->main_thread = 0;
+     }
+ 
+-    int err = dspqueue_close(ctx->dsp_queue); ctx->dsp_queue = NULL;
+-    if (err != 0) {
+-        FARF(ERROR, "Queue close failed with 0x%08x", (unsigned) err);
+-        return err;
++    if (ctx->dsp_queue) {
++        int err = dspqueue_close(ctx->dsp_queue); ctx->dsp_queue = NULL;
++        if (err != 0) {
++            FARF(ERROR, "Queue close failed with 0x%08x", (unsigned) err);
++            return err;
++        }
++    } else {
++        // sync transport: VTCM may still be held from the last execute()
++        vtcm_release(ctx);
+     }
+ 
+     work_queue_free(ctx->work_queue);
+@@ -1256,9 +1269,7 @@
+     return octx->status;
+ }
+ 
+-static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
+-    dspqueue_t queue = ctx->dsp_queue;
+-    int err;
++static bool process_opbatch_core(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf, struct htp_opbatch_rsp * out_rsp) {
+ 
+     const uint32_t n_bufs = req->n_bufs;
+     const uint32_t n_tens = req->n_tensors;
+@@ -1272,7 +1283,7 @@
+ 
+     if (dbuf->size < b_size + t_size + o_size + p_size + tr_size) {
+         FARF(ERROR, "invalid opbatch memory block size %u (req %u)", dbuf->size, b_size + t_size + o_size + p_size + tr_size);
+-        return;
++        return false;
+     }
+ 
+     FARF(HIGH, "processing opbatch #%llu: n-bufs %u n-tensors %u n-ops %u n-traces %u : m-size %u b-size %u t-size %u o-size %u", (unsigned long long) req->seq,
+@@ -1359,32 +1370,85 @@
+ 
+     profile_stop(HTP_PROF_BASIC, &batch_prof);
+ 
+-    struct htp_opbatch_rsp rsp;
+-    memset(&rsp, 0, sizeof(rsp));
+-    rsp.seq          = req->seq;
+-    rsp.status       = octx->status;
+-    rsp.n_bufs       = n_bufs;
+-    rsp.n_tensors    = n_tens;
+-    rsp.n_ops        = n_ops;
+-    rsp.usecs        = batch_prof.usecs;
+-    rsp.cycles_start = batch_prof.cycles_start;
+-    rsp.cycles_stop  = batch_prof.cycles_stop;
++    struct htp_opbatch_rsp * rsp = out_rsp;
++    memset(rsp, 0, sizeof(*rsp));
++    rsp->seq          = req->seq;
++    rsp->status       = octx->status;
++    rsp->n_bufs       = n_bufs;
++    rsp->n_tensors    = n_tens;
++    rsp->n_ops        = n_ops;
++    rsp->usecs        = batch_prof.usecs;
++    rsp->cycles_start = batch_prof.cycles_start;
++    rsp->cycles_stop  = batch_prof.cycles_stop;
+ 
+     if (ctx->profiler == HTP_PROF_TRACE) {
+         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
+-            rsp.n_traces[t] = ctx->trace[t].count;
++            rsp->n_traces[t] = ctx->trace[t].count;
+         }
+     }
+ 
++    return true;
++}
++
++static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
++    struct htp_opbatch_rsp rsp;
++    if (!process_opbatch_core(ctx, req, dbuf, &rsp)) {
++        return;
++    }
++
+     struct dspqueue_buffer write_dbuf = *dbuf;
+     write_dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
+ 
+-    err = dspqueue_write(queue, 0, 1, &write_dbuf, sizeof(rsp), (const uint8_t *) &rsp, DSPQUEUE_TIMEOUT_NONE);
++    int err = dspqueue_write(ctx->dsp_queue, 0, 1, &write_dbuf, sizeof(rsp), (const uint8_t *) &rsp, DSPQUEUE_TIMEOUT_NONE);
+     if (err != 0) {
+         FARF(ERROR, "dspqueue_write failed: 0x%08x", (unsigned) err);
+     }
+ }
+ 
++// IP-305 sync transport: one batch per FastRPC invoke. The descriptor block travels as an inrout
++// argument (FastRPC does the cache maintenance), so no dspqueue buffer flags are needed. VTCM is
++// acquired and released for every synchronous batch; this avoids carrying a cached VTCM lease
++// across FastRPC calls and preserves the resource-manager release semantics.
++AEEResult htp_iface_execute(remote_handle64 handle, const uint8_t * req_b, int req_len, uint8_t * blk, int blk_len, uint8_t * rsp_b, int rsp_len) {
++    struct htp_handle * h = (struct htp_handle *) handle;
++    if (!h || !h->ctx) {
++        return AEE_EBADPARM;
++    }
++    if (req_len < (int) sizeof(struct htp_opbatch_req) || rsp_len < (int) sizeof(struct htp_opbatch_rsp) || !blk || blk_len <= 0) {
++        FARF(ERROR, "execute: bad arg sizes req %d blk %d rsp %d", req_len, blk_len, rsp_len);
++        return AEE_EBADPARM;
++    }
++    struct htp_context * ctx = h->ctx;
++    if (ctx->dsp_queue) {
++        FARF(ERROR, "execute: session runs the dspqueue transport");
++        return AEE_EUNSUPPORTED;
++    }
++
++    struct htp_opbatch_req req;
++    memcpy(&req, req_b, sizeof(req));
++
++    struct dspqueue_buffer dbuf;
++    memset(&dbuf, 0, sizeof(dbuf));
++    dbuf.ptr  = blk;
++    dbuf.size = (uint32_t) blk_len;
++
++    if (ctx->vtcm_needs_release) {
++        vtcm_release(ctx);
++    }
++    vtcm_acquire(ctx);
++
++    struct htp_opbatch_rsp rsp;
++    bool ok = process_opbatch_core(ctx, &req, &dbuf, &rsp);
++
++    vtcm_release(ctx);
++
++    if (!ok) {
++        return AEE_EBADPARM;
++    }
++    memcpy(rsp_b, &rsp, sizeof(rsp));
++    return AEE_SUCCESS;
++}
++
+ #define DSPQUEUE_READ_TIMEOUT_USEC 5000
+ #define DSPQUEUE_POLL_TIMEOUT_USEC 100
+ #define DSPQUEUE_POLL_COUNT        100
+

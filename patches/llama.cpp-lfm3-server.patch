@@ -1,0 +1,57 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 3ca27762c..d1a242e42 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1237,7 +1237,7 @@ private:
+             mparams.use_gpu          = params_base.mmproj_use_gpu;
+             mparams.device           = params_base.mmproj_device;
+             mparams.print_timings    = false;
+-            mparams.n_threads        = params_base.cpuparams.n_threads;
++            mparams.n_threads        = params_base.cpuparams_batch.n_threads; // media encoding is prompt work: the batch pool, not the (pinned, smaller) decode pool
+             mparams.flash_attn_type  = params_base.flash_attn_type;
+             mparams.warmup           = params_base.warmup;
+             mparams.image_min_tokens = params_base.image_min_tokens;
+@@ -4174,6 +4174,11 @@ private:
+                                             if (cur.pos_max > pos_next) {
+                                                 return false;
+                                             }
++                                            // hybrid recurrent + SWA (LFM3): pos_min is the recurrent cell (= pos_max), but the
++                                            // checkpoint also holds the SWA window ending at pos_max, enough to resume at pos_max + 1
++                                            if (n_swa > 0 && cur.pos_min == cur.pos_max && cur.pos_max > 0) {
++                                                return cur.pos_max < pos_eval;
++                                            }
+                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                         }
+                                     );
+@@ -4365,6 +4370,16 @@ private:
+                             slot.prompt.tokens.push_back_placeholder(chunk.get());
+                         }
+ 
++                        // checkpoint the state right after the media chunk, so a later request with the same media prefix
++                        // and a different text suffix resumes here instead of re-encoding (llama.cpp #26994)
++                        if (do_checkpoint) {
++                            const auto ck_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
++                            const auto ck_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
++                            if (ck_min >= 0) {
++                                create_checkpoint(slot, 0, ck_min, ck_max);
++                            }
++                        }
++
+                         has_mtmd = true;
+                     }
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index d7ac2a1dc..0edd28e64 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -726,6 +726,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
+             {"output_tokens", n_decoded},
+             {"total_tokens",  n_decoded + n_prompt_tokens},
+             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
++            // OpenAI's transcription usage carries input_token_details {audio_tokens, text_tokens}; clients that validate
++            // it (LiteLLM) reject the response without it. The media/text split is not tracked here: all prompt tokens
++            // are reported as audio.
++            {"input_token_details", json { {"audio_tokens", n_prompt_tokens}, {"text_tokens", 0} }},
+         }},
+     };
+     return event;

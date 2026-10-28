@@ -1,0 +1,19 @@
+{
+  "date": "2026-10-28",
+  "repository": "abliter8-ai/lfm3-1.7B-abliter8-gguf",
+  "experimental": true,
+  "files": [
+    {
+      "name": "LFM3-1.7B--abliter8-Q6_K_ROCMFPX.gguf",
+      "size_bytes": 1429945184,
+      "sha256": "978bed0f4c29f618c7f7343405455cd9c2830104ca0a08b9bfbcd5d8471a1724",
+      "guide": "docs/amd.md"
+    },
+    {
+      "name": "LFM3-1.7B-Abliter8-NVFP4-GATE0-11-Q8_0.gguf",
+      "size_bytes": 1751866144,
+      "sha256": "2ddaba3512bc137a3ef6a905461989afc37a92dc9015fdbc8ba5926c0e79c87b",
+      "guide": "docs/nvidia.md"
+    }
+  ]
+}
